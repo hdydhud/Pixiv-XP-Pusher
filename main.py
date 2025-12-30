@@ -12,7 +12,7 @@ from apscheduler.triggers.cron import CronTrigger
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config import load_config, CONFIG_PATH
-from database import init_db, cache_illust, get_cached_illust_tags, mark_pushed
+from database import init_db, cache_illust, get_cached_illust_tags, get_cached_illust, mark_pushed
 from pixiv_client import PixivClient
 from profiler import XPProfiler
 from fetcher import ContentFetcher
@@ -24,6 +24,12 @@ from utils import setup_logging
 logger = logging.getLogger(__name__)
 
 
+# 全局运行锁，防止任务并发
+_task_lock = asyncio.Lock()
+
+# 全局链式反应追踪器 {user_id: {"count": 0, "last_time": timestamp}}
+_chain_tracker = {}
+
 async def setup_notifiers(config: dict, client: PixivClient, profiler: XPProfiler):
     """创建并配置推送器（支持多推送渠道）"""
     notifier_cfg = config.get("notifier", {})
@@ -32,20 +38,92 @@ async def setup_notifiers(config: dict, client: PixivClient, profiler: XPProfile
     if isinstance(notifier_types, str):
         notifier_types = [notifier_types]
     
+    # 延迟引用避免因为 notifiers 列表未初始化完成导致的问题
+    # 但 on_feedback 需要访问 notifiers 列表
+    # 我们可以把 notifiers 定义在外部列表，然后引用它
+    notifiers_list = []
+    max_pages = notifier_cfg.get("max_pages", 10)
+
+    async def push_related_task(seed_illust, user_id):
+        """异步：推送关联作品"""
+        try:
+            logger.info(f"🔗 触发连锁反应: 正在获取 {seed_illust.id} 的关联作品...")
+            # 1. 获取关联
+            related = await client.get_related_illusts(seed_illust.id, limit=20)
+            if not related:
+                logger.info(f"🔗 作品 {seed_illust.id} 无关联推荐，连锁结束")
+                return
+
+            # 2. 过滤 (复用 ContentFilter 逻辑，但简化参数)
+            from filter import ContentFilter
+            # 临时构造 filter 配置
+            filter_cfg = config.get("filter", {})
+            c_filter = ContentFilter(
+                blacklist_tags=list(profiler.stop_words), # 使用实时黑名单
+                exclude_ai=filter_cfg.get("exclude_ai", True),
+                r18_mode=filter_cfg.get("r18_mode", False),
+                min_create_days=filter_cfg.get("min_create_days", 0)
+            )
+            
+            # 使用简单的过滤逻辑 (不去重 SENT_HISTORY，因为这是用户主动要求的)
+            # 但我们要去重 "已收藏" 和 "画师屏蔽"
+            filtered = []
+            import database as db_mod
+            xp_profile = await db_mod.get_xp_profile()
+            
+            for ill in related:
+                if ill.id == seed_illust.id: continue
+                # 检查屏蔽
+                if not c_filter.check_illust(ill): continue
+                if ill.user_id in profiler._blocked_artist_ids: continue
+                
+                # 计算分数
+                score = 0
+                for t in ill.tags:
+                     norm = t.lower().replace(" ", "_")
+                     if norm in xp_profile: score += xp_profile[norm]
+                
+                # Artist Boost
+                import database as db_mod
+                artist_score = await db_mod.get_artist_score(ill.user_id)
+                score += artist_score
+                
+                filtered.append((ill, score))
+            
+            # 排序取前 N
+            filtered.sort(key=lambda x: x[1], reverse=True)
+            
+            push_limit = config.get("feedback", {}).get("related_push_limit", 1)
+            top_results = [x[0] for x in filtered[:push_limit]]
+            
+            if top_results:
+                logger.info(f"🔗 连锁推送: {len(top_results)} 个关联作品")
+                for n in notifiers_list:
+                    # 仅推送给触发的用户 (如果是 private feedback)
+                    # 目前 notify 接口通常是广播或指定 chat_id
+                    # 简单起见，广播给配置的 chat_ids (TelegramNotifier 会处理)
+                    await n.push_illusts(top_results, message_prefix="🔗 猜你喜欢 (及关联画师):")
+            else:
+                logger.info("🔗 关联作品过滤后为空")
+
+        except Exception as e:
+            logger.error(f"连锁推送失败: {e}")
+
     async def on_feedback(illust_id: int, action: str):
-        """反馈回调"""
-        # 从缓存获取作品tags
-        cached_tags = await get_cached_illust_tags(illust_id)
-        if cached_tags:
-            # 创建简化的Illust对象
+        """反馈回调 (优化版：使用缓存避免 API 调用)"""
+        illust = None
+        
+        # 1. 尝试从缓存获取
+        cached = await get_cached_illust(illust_id)
+        if cached:
             from pixiv_client import Illust
             from datetime import datetime
             illust = Illust(
-                id=illust_id,
+                id=cached["id"],
                 title="",
-                user_id=0,
-                user_name="",
-                tags=cached_tags,
+                user_id=cached.get("user_id", 0),
+                user_name=cached.get("user_name", ""),
+                tags=cached.get("tags", []),
                 bookmark_count=0,
                 view_count=0,
                 page_count=1,
@@ -54,22 +132,83 @@ async def setup_notifiers(config: dict, client: PixivClient, profiler: XPProfile
                 ai_type=0,
                 create_date=datetime.now()
             )
-            await profiler.apply_feedback(
-                illust=illust,
-                action=action,
-                config=config.get("feedback", {})
-            )
-            
-            # 如果是"喜欢"，同步添加到 Pixiv 收藏
-            if action in ("like", "1"):
-                 try:
-                     await client.add_bookmark(illust_id)
-                 except Exception as e:
-                     logger.error(f"同步收藏失败: {e}")
-            
-            logger.info(f"反馈处理完成: illust_id={illust_id}, action={action}")
-        else:
-            logger.warning(f"未找到作品缓存: {illust_id}")
+            # 是否需要完整信息（如点赞时不知道画家ID）
+            if (action in ("like", "1") and illust.user_id == 0):
+                try:
+                    full = await client.get_illust_detail(illust_id)
+                    if full: illust = full
+                except Exception as e:
+                    logger.warning(f"补充详情失败: {e}")
+        
+        # 2. 缓存未命中，回退到 API
+        if not illust:
+            logger.warning(f"未找到作品缓存: {illust_id}，尝试从 API 获取...")
+            try:
+                illust = await client.get_illust_detail(illust_id)
+                if illust:
+                    # 补充写入缓存
+                    await cache_illust(illust.id, illust.tags, illust.user_id, illust.user_name)
+                    logger.info(f"API 获取成功并已缓存: {illust.title}")
+            except Exception as e:
+                logger.error(f"API 回退获取失败: {e}")
+        
+        if not illust:
+            logger.error(f"无法获取作品信息: {illust_id}，反馈处理中止")
+            return
+
+        # 3. 执行核心反馈逻辑
+        suggested_block_tag = await profiler.apply_feedback(
+            illust=illust,
+            action=action,
+            config=config.get("feedback", {})
+        )
+        
+        # 如果 profiler 建议屏蔽
+        if suggested_block_tag:
+             msg = f"🚫 Tag `{suggested_block_tag}` 累计不喜欢已达阈值。\n是否屏蔽？\n发送 `/block {suggested_block_tag}` 确认屏蔽。"
+             for n in notifiers_list:
+                 if hasattr(n, 'send_text'):
+                     await n.send_text(msg)
+        
+        # 如果是"喜欢"，同步添加到 Pixiv 收藏
+        if action in ("like", "1"):
+             try:
+                 await client.add_bookmark(illust_id)
+                 
+                 # 更新 MAB 策略反馈
+                 from database import get_push_source, update_strategy_stats
+                 source = await get_push_source(illust_id)
+                 if source:
+                     await update_strategy_stats(source, is_success=True)
+                     logger.info(f"MAB策略 '{source}' 获得正反馈")
+                
+                 # === Chain Reaction Logic ===
+                 if "related" in config.get("strategies", ["related"]):
+                     user_key = "global"
+                     now = datetime.now().timestamp()
+                     tracker = _chain_tracker.get(user_key, {"count": 0, "last_time": 0})
+                     
+                     if now - tracker["last_time"] > 300:
+                         tracker["count"] = 0
+                         
+                     max_depth = config.get("feedback", {}).get("max_chain_depth", 3)
+                     
+                     if tracker["count"] < max_depth:
+                         tracker["count"] += 1
+                         tracker["last_time"] = now
+                         _chain_tracker[user_key] = tracker
+                         
+                         asyncio.create_task(push_related_task(illust, 0))
+                     else:
+                         logger.info("🔗 连锁反应达到上限，跳过")
+                     
+             except Exception as e:
+                 logger.error(f"同步收藏/连锁处理失败: {e}")
+        
+        logger.info(f"反馈处理完成: illust_id={illust_id}, action={action}")
+    
+    # ... (rest of setup_notifiers) ...
+
             
     async def on_action(action: str, data: any):
         """通用动作回调"""
@@ -108,6 +247,49 @@ async def setup_notifiers(config: dict, client: PixivClient, profiler: XPProfile
                 
             except Exception as e:
                 logger.error(f"重试失败: {e}")
+        
+        elif action == "run_task":
+             # 手动触发推送任务
+             logger.info("🤖 收到 Bot 手动推送指令")
+             # 确保 config, client, profiler, notifiers 可用
+             # 这里是一个闭包，可以直接访问外部变量
+             # 使用 create_task 异步执行，避免阻塞 Bot 响应
+             asyncio.create_task(main_task(config, client, profiler, notifiers))
+             
+        elif action == "update_schedule":
+            # 更新调度计划 (支持多个时间)
+            schedule_str = str(data)
+            logger.info(f"📅 收到调度更新请求: {schedule_str}")
+            try:
+                # 1. 持久化
+                from database import set_state
+                await set_state("schedule_cron", schedule_str)
+                
+                # 2. 如果 scheduler 实例存在，重新调度
+                if 'scheduler' in config:
+                    sched = config['scheduler']
+                    
+                    # 移除所有旧的 push_job
+                    for job in sched.get_jobs():
+                        if job.id.startswith('push_job'):
+                            sched.remove_job(job.id)
+                    
+                    # 添加新的任务
+                    cron_list = [c.strip() for c in schedule_str.split(",") if c.strip()]
+                    for i, cron_expr in enumerate(cron_list):
+                        try:
+                            sched.add_job(
+                                main_task, 
+                                CronTrigger.from_crontab(cron_expr),
+                                args=[config, client, profiler, notifiers],
+                                id=f'push_job_{i}'
+                            )
+                        except Exception as e:
+                            logger.error(f"添加任务失败 ({cron_expr}): {e}")
+                    
+                    logger.info(f"✅ 调度任务已更新，共 {len(cron_list)} 个时间点")
+            except Exception as e:
+                logger.error(f"更新调度失败: {e}")
     
     notifiers = []
     
@@ -124,7 +306,13 @@ async def setup_notifiers(config: dict, client: PixivClient, profiler: XPProfile
                 allowed_users=tg_cfg.get("allowed_users"),
                 thread_id=tg_cfg.get("thread_id"),
                 on_feedback=on_feedback,
-                on_action=on_action
+                on_action=on_action,
+                proxy_url=tg_cfg.get("proxy_url"),
+                max_pages=max_pages,
+                image_quality=tg_cfg.get("image_quality", 85),
+                max_image_size=tg_cfg.get("max_image_size", 2000),
+                topic_rules=tg_cfg.get("topic_rules"),
+                topic_tag_mapping=tg_cfg.get("topic_tag_mapping")
             ))
             logger.info("已启用 Telegram 推送")
     
@@ -138,7 +326,10 @@ async def setup_notifiers(config: dict, client: PixivClient, profiler: XPProfile
                 push_to_private=ob_cfg.get("push_to_private", True),
                 push_to_group=ob_cfg.get("push_to_group", False),
                 master_id=ob_cfg.get("master_id"),
-                on_feedback=on_feedback
+                on_feedback=on_feedback,
+                on_action=on_action,
+                client=client,
+                max_pages=max_pages
             )
             try:
                 await ob_notifier.connect()
@@ -170,7 +361,9 @@ async def setup_services(config: dict):
         client=client,
         stop_words=profiler_cfg.get("stop_words"),
         discovery_rate=profiler_cfg.get("discovery_rate", 0.1),
-        ai_config=profiler_cfg.get("ai")
+        time_decay_days=profiler_cfg.get("time_decay_days", 180),
+        ai_config=profiler_cfg.get("ai"),
+        saturation_threshold=profiler_cfg.get("saturation_threshold", 0.5)
     )
     
     # Init Notifiers
@@ -183,7 +376,11 @@ async def main_task(config: dict, client: PixivClient, profiler: XPProfiler, not
     """
     执行一次完整的推送任务 (依赖外部服务)
     """
-    logger.info("=== 开始推送任务 ===")
+    if _task_lock.locked():
+        logger.info("⏳ 推送任务正在运行中，本次触发已跳过或排队")
+    
+    async with _task_lock:
+        logger.info("=== 开始推送任务 ===")
     
     try:
         # 1. 构建/更新 XP 画像
@@ -233,20 +430,14 @@ async def main_task(config: dict, client: PixivClient, profiler: XPProfiler, not
         # 执行 Discovery (Search + Ranking + Subs)
         top_tags = await profiler.get_top_tags(profiler_cfg.get("top_n", 20)) # Re-get is cheap
         
-        # 执行 Discovery (Search + Ranking + Subs)
-        search_results = await fetcher.discover(
-             xp_tags=top_tags,
-             limit=fetcher_cfg.get("discovery_limit", 200)
+        # 执行 Discovery (Search + Ranking + Subs) -> MAB Scheduled
+        top_tags = await profiler.get_top_tags(profiler_cfg.get("top_n", 20)) # Re-get is cheap
+        
+        all_illusts = await fetcher.fetch_content(
+             xp_tags=top_tags, 
+             total_limit=fetcher_cfg.get("discovery_limit", 200)
         )
-
-        # Check Subs
-        subscription_results = await fetcher.check_subscriptions()
-        
-        # Ranking
-        ranking_results = await fetcher.fetch_ranking()
-        
-        all_illusts = search_results + subscription_results + ranking_results
-        logger.info(f"共获取 {len(all_illusts)} 个候选作品 (搜索:{len(search_results)}, 订阅:{len(subscription_results)}, 排行榜:{len(ranking_results)})")
+        logger.info(f"共获取 {len(all_illusts)} 个候选作品")
         
         # 3. 过滤
         filter_cfg = config.get("filter", {})
@@ -272,7 +463,7 @@ async def main_task(config: dict, client: PixivClient, profiler: XPProfiler, not
             try:
                 # 缓存作品信息
                 for illust in filtered:
-                    await cache_illust(illust.id, illust.tags)
+                    await cache_illust(illust.id, illust.tags, illust.user_id, illust.user_name)
                 
                 all_sent_ids = set()
                 for notifier in notifiers:
@@ -286,10 +477,15 @@ async def main_task(config: dict, client: PixivClient, profiler: XPProfiler, not
                     # 记录推送历史
                     filtered_map = {ill.id: ill for ill in filtered}
                     for pid in all_sent_ids:
+
                         if pid in filtered_map:
                             illust = filtered_map[pid]
-                            source = "subscription" if illust.user_id in manual_subs else "search"
+                            source = getattr(illust, 'source', 'unknown')
                             await mark_pushed(pid, source)
+                            
+                            # 更新 MAB 策略统计 (Total Count)
+                            if source in ['xp_search', 'subscription', 'ranking']:
+                                await db_module.update_strategy_stats(source, is_success=False)
                             
                     logger.info(f"推送完成: {len(all_sent_ids)}/{len(filtered)} 个作品成功")
                 else:
@@ -346,6 +542,90 @@ async def run_once(config: dict):
                 except: 
                     pass
 
+async def daily_report_task(config: dict, notifiers: list, profiler=None):
+    """每日维护任务：生成日报 + 数据清理 + AI 标签刷新"""
+    logger.info("📊 开始执行每日维护任务...")
+    
+    maintenance_summary = []
+    
+    try:
+        from database import (
+            get_top_xp_tags, get_all_strategy_stats, 
+            sync_blocked_tags_to_xp, get_uncached_tags, cleanup_old_sent_history
+        )
+        
+        # ========== 1. 生成日报 ==========
+        top_tags = await get_top_xp_tags(10)
+        stats = await get_all_strategy_stats()
+        
+        lines = ["📊 **每日 XP 日报**\n"]
+        
+        if top_tags:
+            lines.append("🎯 **Top 10 XP 标签**")
+            for i, (tag, weight) in enumerate(top_tags[:10], 1):
+                lines.append(f"  {i}. `{tag}` ({weight:.1f})")
+            lines.append("")
+        
+        if stats:
+            lines.append("📈 **MAB 策略表现**")
+            strategy_names = {"search": "XP搜索", "xp_search": "XP搜索", "subscription": "订阅", "ranking": "排行榜"}
+            for strategy, data in stats.items():
+                name = strategy_names.get(strategy, strategy)
+                rate_pct = data["rate"] * 100
+                lines.append(f"  • {name}: {data['success']}/{data['total']} ({rate_pct:.1f}%)")
+        
+        # ========== 2. 同步屏蔽标签到 XP 画像 ==========
+        blocked_removed = await sync_blocked_tags_to_xp()
+        if blocked_removed > 0:
+            maintenance_summary.append(f"🚫 从画像中移除 {blocked_removed} 个已屏蔽标签")
+            logger.info(f"已从 XP 画像中移除 {blocked_removed} 个屏蔽标签")
+        
+        # ========== 3. AI 标签增量处理 ==========
+        if profiler and hasattr(profiler, 'ai_processor') and profiler.ai_processor.enabled:
+            uncached_tags = await get_uncached_tags(limit=200)
+            if uncached_tags:
+                logger.info(f"发现 {len(uncached_tags)} 个未处理标签，启动 AI 清洗...")
+                try:
+                    valid_tags, mapping = await profiler.ai_processor.process_tags(uncached_tags)
+                    maintenance_summary.append(f"🤖 AI 清洗 {len(uncached_tags)} 个标签 → {len(valid_tags)} 个有效")
+                    logger.info(f"AI 清洗完成: {len(valid_tags)}/{len(uncached_tags)} 有效")
+                except Exception as e:
+                    logger.error(f"AI 清洗失败: {e}")
+                    maintenance_summary.append(f"⚠️ AI 清洗失败: {e}")
+        
+        # ========== 4. 清理旧数据 ==========
+        old_removed = await cleanup_old_sent_history(days=30)
+        if old_removed > 0:
+            maintenance_summary.append(f"🗑️ 清理 {old_removed} 条过期推送记录")
+            logger.info(f"已清理 {old_removed} 条 30 天前的推送历史")
+        
+        # 清理旧作品缓存
+        from database import cleanup_old_illust_cache
+        cache_removed = await cleanup_old_illust_cache(days=60)
+        if cache_removed > 0:
+            maintenance_summary.append(f"🗑️ 清理 {cache_removed} 条过期作品缓存")
+            logger.info(f"已清理 {cache_removed} 条 60 天前的作品缓存")
+        
+        # ========== 5. 添加维护摘要到日报 ==========
+        if maintenance_summary:
+            lines.append("")
+            lines.append("🛠️ **维护记录**")
+            for item in maintenance_summary:
+                lines.append(f"  {item}")
+        
+        report_msg = "\n".join(lines)
+        
+        # ========== 6. 发送日报 ==========
+        for n in notifiers:
+            if hasattr(n, 'send_text'):
+                await n.send_text(report_msg)
+                break
+        
+        logger.info("✅ 每日维护任务完成")
+        
+    except Exception as e:
+        logger.error(f"每日维护任务失败: {e}")
+
 
 async def run_scheduler(config: dict, run_immediately: bool = False):
     """启动调度器 (Daemon Mode)"""
@@ -371,27 +651,79 @@ async def run_scheduler(config: dict, run_immediately: bool = False):
 
     scheduler = AsyncIOScheduler()
     scheduler_cfg = config.get("scheduler", {})
-    cron_expr = scheduler_cfg.get("cron", "0 12 * * *")
     coalesce = scheduler_cfg.get("coalesce", True)
     
-    parts = cron_expr.split()
-    trigger = CronTrigger(
-        minute=parts[0],
-        hour=parts[1],
-        day=parts[2] if parts[2] != "*" else None,
-        month=parts[3] if parts[3] != "*" else None,
-        day_of_week=parts[4] if parts[4] != "*" else None
-    )
+    # 获取调度配置 (优先读取数据库)
+    from database import get_state
+    db_cron = await get_state("schedule_cron")
+    config_cron = config.get("scheduler", {}).get("cron", "0 20 * * *")
     
-    scheduler.add_job(
-        lambda: asyncio.create_task(main_task(config, client, profiler, notifiers)),
-        trigger=trigger,
-        coalesce=coalesce,
-        misfire_grace_time=3600
-    )
+    schedule_str = db_cron if db_cron else config_cron
+    
+    # 将 scheduler 注入到 config 中以便 callback 访问
+    config['scheduler'] = scheduler
+    
+    # 支持多个时间点
+    # 逻辑优化：
+    # 1. 先尝试将整个字符串作为一个 Cron，如果成功则认为是一个任务 (解决 "0 12,21 * * *" 被误拆的问题)
+    # 2. 如果失败，再尝试用逗号分割 (兼容旧的多任务写法 "0 12 * * *, 0 21 * * *")
+    
+    cron_list = []
+    
+    # 尝试解析整体
+    try:
+        CronTrigger.from_crontab(schedule_str.strip())
+        cron_list = [schedule_str.strip()]
+        logger.info(f"识别为单一定时任务: {schedule_str}")
+    except ValueError:
+        # 整体解析失败，尝试分割
+        potential_crons = [c.strip() for c in schedule_str.split(",") if c.strip()]
+        valid_crons = []
+        for c in potential_crons:
+            try:
+                CronTrigger.from_crontab(c)
+                valid_crons.append(c)
+            except ValueError:
+                logger.warning(f"忽略无效的 Cron 表达式片段: {c}")
+        
+        if valid_crons:
+            cron_list = valid_crons
+            logger.info(f"识别为 {len(cron_list)} 个独立定时任务")
+        else:
+            # 如果分割也全错，那可能就是整体写错了，保留整体让后面报错
+            cron_list = [schedule_str]
+    
+    for i, cron_expr in enumerate(cron_list):
+        try:
+            scheduler.add_job(
+                main_task, 
+                CronTrigger.from_crontab(cron_expr),
+                args=[config, client, profiler, notifiers],
+                id=f'push_job_{i}',
+                coalesce=coalesce,
+                misfire_grace_time=3600
+            )
+            logger.info(f"已添加定时任务 #{i+1}: {cron_expr}")
+        except Exception as e:
+            logger.error(f"添加定时任务失败 ({cron_expr}): {e}")
+    
+    # 每日维护任务 (日报 + 清理)
+    daily_cron = scheduler_cfg.get("daily_report_cron", "0 0 * * *")  # 默认每天00:00
+    try:
+        scheduler.add_job(
+            daily_report_task,
+            CronTrigger.from_crontab(daily_cron),
+            args=[config, notifiers, profiler],  # 传入 profiler 以支持 AI 清洗
+            id='daily_report_job',
+            coalesce=True,
+            misfire_grace_time=3600
+        )
+        logger.info(f"已添加每日维护任务: {daily_cron}")
+    except Exception as e:
+        logger.error(f"添加每日维护任务失败: {e}")
     
     scheduler.start()
-    logger.info(f"调度器已启动，cron: {cron_expr}")
+    logger.info(f"调度器已启动，共 {len(cron_list)} 个推送任务 + 1 个每日维护任务")
     
     try:
         while True:

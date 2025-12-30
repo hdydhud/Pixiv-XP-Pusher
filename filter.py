@@ -39,12 +39,14 @@ def calculate_match_score(illust: Illust, xp_profile: dict[str, float]) -> float
     high_weight_matches = 0
     
     for tag in illust.tags:
-        # 尝试多种格式匹配
-        normalized_tag = tag.lower().replace(" ", "_")
+        # 使用统一的归一化逻辑
+        from utils import normalize_tag
+        normalized_tag = normalize_tag(tag)
         
         weight = None
         if normalized_tag in xp_profile:
             weight = xp_profile[normalized_tag]
+        # Fallback: 尝试原始Tag的小写 (有些特例可能未被归一化覆盖)
         elif tag.lower() in xp_profile:
             weight = xp_profile[tag.lower()]
         
@@ -234,6 +236,35 @@ class ContentFilter:
         logger.info(f"过滤后剩余 {len(final_result)} 个作品 (涉及 {len(artist_count)} 个画师)")
         return final_result
     
+    def check_illust(self, illust: Illust) -> bool:
+        """检查单个作品是否满足基本过滤条件 (Blacklist, AI, R18, Time)"""
+        # 1. 基础有效性
+        if not illust.id: return False
+        
+        # 2. 时间过滤 (如果配置)
+        if self.min_create_days > 0:
+            from datetime import datetime, timedelta
+            time_threshold = datetime.now(illust.create_date.tzinfo) - timedelta(days=self.min_create_days)
+            if illust.create_date < time_threshold:
+                return False
+
+        # 3. R-18G / Blacklist
+        if self._has_blacklisted_tag(illust):
+            return False
+            
+        # 4. AI 排除
+        if self.exclude_ai and illust.ai_type == 2:
+            return False
+            
+        # 5. R-18 Mode
+        mode_str = str(self.r18_mode).lower()
+        if mode_str in ("true", "r18_only", "pure"):
+            if not illust.is_r18: return False
+        elif mode_str in ("safe", "18-", "clean"):
+            if illust.is_r18: return False
+            
+        return True
+
     def _has_blacklisted_tag(self, illust: Illust) -> bool:
         """检查是否包含黑名单Tag"""
         for tag in illust.tags:

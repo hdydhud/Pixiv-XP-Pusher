@@ -47,3 +47,5 @@ geckodriver.log
 
 # Mac
 .DS_Store
+
+test_*.py

@@ -12,7 +12,12 @@ import random
 import time
 from functools import wraps
 from logging.handlers import RotatingFileHandler
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+import io
+import zipfile
+import tempfile
+import os
 
 import aiohttp
 
@@ -223,3 +228,162 @@ async def download_image_with_referer(
         async with semaphore:
             return await _download()
     return await _download()
+
+
+# --- Tag Normalization Utilities ---
+
+import re
+
+# 常见别名映射表 (与 profiler.py 保持一致)
+TAG_ALIASES = {
+    "白髪": "white_hair",
+    "silver hair": "white_hair",
+    "白髮": "white_hair",
+    "猫耳": "cat_ears",
+    "cat ears": "cat_ears",
+    "nekomimi": "cat_ears",
+    "ロリ": "loli",
+    "巨乳": "large_breasts",
+    "おっぱい": "breasts",
+    "黒髪": "black_hair",
+    "金髪": "blonde_hair",
+    "ツインテール": "twintails",
+    "twin tails": "twintails",
+    "maid": "maid",
+    "メイド": "maid",
+    "水着": "swimsuit",
+    "制服": "uniform",
+    "ストッキング": "stockings",
+    "ニーソ": "thighhighs",
+    "眼鏡": "glasses",
+}
+
+_pattern_users = re.compile(r"^(.*?)\d+users入り$", re.IGNORECASE)
+
+def normalize_tag(tag: str) -> str:
+    """
+    Tag归一化 (Shared logic)
+    1. 去除 xxxusers入り 后缀
+    2. 统一转小写
+    3. 去除空格
+    4. 别名映射
+    """
+    tag = tag.strip()
+    
+    # 去除 users入り 后缀
+    match = _pattern_users.match(tag)
+    if match:
+        prefix = match.group(1)
+        if prefix:  # 如果前缀非空，使用前缀
+            tag = prefix
+    
+    tag = tag.lower()
+    
+    # 检查别名映射
+    for alias, canonical in TAG_ALIASES.items():
+        if tag == alias.lower():
+            return canonical
+    
+    # 替换空格为下划线
+    tag = tag.replace(" ", "_")
+    
+    return tag
+
+
+def convert_ugoira_to_mp4(zip_data: bytes, frames: list[dict]) -> bytes:
+    """将 Ugoira ZIP 转换为 MP4 (依赖 imageio[ffmpeg])"""
+    try:
+        import imageio
+    except ImportError:
+        logger.warning("未安装 imageio，无法本地转换动图。请 pip install imageio[ffmpeg]")
+        return None
+
+    try:
+        # 解压 zip
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+            images = []
+            
+            # 按 frames 顺序读取
+            for frame in frames:
+                fname = frame['file']
+                with zf.open(fname) as f:
+                    # imageio.imread 支持读取 bytes
+                    img = imageio.imread(f.read())
+                    images.append(img)
+            
+            # 计算 fps
+            total_delay = sum(f['delay'] for f in frames)
+            if not total_delay: return None
+            
+            avg_delay = total_delay / len(frames)
+            fps = 1000 / avg_delay
+            
+            # 写入 MP4 到 BytesIO 需要 imageio 支持 ffmpeg plugin
+            # 由于 BytesIO 写入比较复杂（需要 format='mp4' 且 ffmpeg 支持 pipe），
+            # 使用临时文件更稳妥
+            
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+            
+            try:
+                # 显式指定 pixelformat 避免部分播放器黑屏
+                # macro_block_size=None 避免尺寸不是16倍数报错
+                imageio.mimwrite(tmp_path, images, fps=fps, codec='libx264', pixelformat='yuv420p', macro_block_size=None)
+                
+                with open(tmp_path, "rb") as f:
+                    mp4_bytes = f.read()
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            
+            return mp4_bytes
+            
+    except Exception as e:
+        logger.error(f"动图转换失败: {e}")
+        return None
+
+
+def convert_ugoira_to_gif(zip_data: bytes, frames: list[dict], max_width: int = 720) -> bytes:
+    """将 Ugoira ZIP 转换为 GIF (使用 Pillow，不依赖 ffmpeg)"""
+    from PIL import Image
+    import io
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+            images = []
+            durations = []
+            
+            for frame in frames:
+                fname = frame['file']
+                with zf.open(fname) as f:
+                    img = Image.open(f)
+                    img.load() # 确保加载到内存
+                    
+                    # 缩放以控制体积
+                    if img.width > max_width:
+                        h = int(img.height * (max_width / img.width))
+                        img = img.resize((max_width, h), Image.Resampling.LANCZOS)
+                    
+                    images.append(img)
+                    durations.append(frame['delay'])
+            
+            if not images:
+                return None
+            
+            output = io.BytesIO()
+            # 保存为 GIF
+            images[0].save(
+                output,
+                format='GIF',
+                save_all=True,
+                append_images=images[1:],
+                duration=durations,
+                loop=0,
+                optimize=True
+            )
+            return output.getvalue()
+            
+    except Exception as e:
+        logging.error(f"GIF 转换失败: {e}")
+        return None

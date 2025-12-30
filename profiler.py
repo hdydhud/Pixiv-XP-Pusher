@@ -186,112 +186,86 @@ class AITagProcessor:
         """处理单批次并持久化"""
         prompt = self._build_prompt(tags)
         
-        try:
-            logger.info("🤖 正在请求 AI清洗...")
-            content = await self._call_api(prompt)
-            
-            # 清洗 Markdown
-            content = content.strip()
-            if content.startswith("```json"): content = content[7:]
-            if content.startswith("```"): content = content[3:]
-            if content.endswith("```"): content = content[:-3]
-            
-            result = json.loads(content)
-            
-            meaningless = set(result.get("meaningless", []))
-            synonyms = result.get("synonyms", {})
-            
-            # 构造更新映射
-            cache_update = {}
-            mapping_update = {} # 仅用于 update_tag_mapping_stats (统计用)
-            
-            for tag in tags:
-                if tag in meaningless:
-                    cache_update[tag] = None
-                elif tag in synonyms:
-                    cleaned = synonyms[tag]
-                    cache_update[tag] = cleaned
-                    mapping_update[tag] = cleaned
+        last_error = None
+        max_logic_retries = 5
+        
+        for attempt in range(max_logic_retries):
+            try:
+                logger.info(f"🤖 正在请求 AI清洗 (尝试 {attempt+1}/{max_logic_retries})...")
+                content = await self._call_api(prompt)
+                
+                # 清洗 Markdown
+                content = content.strip()
+                if content.startswith("```json"): content = content[7:]
+                if content.startswith("```"): content = content[3:]
+                if content.endswith("```"): content = content[:-3]
+                
+                # 直接解析，失败则触发外层重试
+                result = json.loads(content)
+    
+                meaningless = set(result.get("meaningless", []))
+                synonyms = result.get("synonyms", {})
+                
+                # 构造更新映射
+                cache_update = {}
+                mapping_update = {} 
+                
+                for tag in tags:
+                    if tag in meaningless:
+                        cache_update[tag] = None
+                    elif tag in synonyms:
+                        cleaned = synonyms[tag]
+                        cache_update[tag] = cleaned
+                        mapping_update[tag] = cleaned
+                    else:
+                        cache_update[tag] = tag
+                
+                # 更新内存缓存
+                self._cache.update(cache_update)
+                
+                # 持久化到 DB
+                await db.update_ai_cache(cache_update) 
+                if mapping_update:
+                    await db.update_tag_mapping_stats(mapping_update)
+                    
+                # 美化日志输出
+                logger.info(f"✨ AI Batch 完成 (本批 {len(tags)} 个)")
+                
+                if meaningless:
+                    logger.info(f"   🗑️ 过滤 {len(meaningless)} 个标签")
+                if synonyms:
+                    logger.info(f"   🔄 归类 {len(synonyms)} 个标签")
+                
+                # 成功则直接返回
+                return
+
+            except Exception as e:
+                last_error = e
+                # 简化报错日志
+                error_msg = str(e)
+                if "524" in error_msg:
+                    logger.warning(f"AI API超时 (524)")
                 else:
-                    # 未提及的默认为保留
-                    cache_update[tag] = tag
-            
-            # 更新内存缓存
-            self._cache.update(cache_update)
-            
-            # 持久化到 DB
-            await db.update_ai_cache(cache_update) # 关键：保存结果
-            if mapping_update:
-                await db.update_tag_mapping_stats(mapping_update)
+                    logger.warning(f"AI处理批次失败 (尝试 {attempt+1}): {e}")
                 
-            # 美化日志输出
-            logger.info(f"✨ AI Batch 完成 (本批 {len(tags)} 个)")
+                # 如果不是最后一次尝试，等待后重试
+                if attempt < max_logic_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+
+        # 如果所有重试都失败，执行最终的错误处理
+        if last_error:
+            logger.error(f"❌ AI Batch 最终失败: {last_error}")
             
-            if meaningless:
-                logger.info(f"   🗑️ 过滤 {len(meaningless)}:")
-                items = list(meaningless)
-                for i in range(0, len(items), 10):
-                    logger.info(f"      {', '.join(items[i:i+10])}")
-                
-            if synonyms:
-                logger.info(f"   🔄 归类 {len(synonyms)}:")
-                items = [f"{k}→{v}" for k, v in synonyms.items()]
-                for i in range(0, len(items), 5):
-                    logger.info(f"      {', '.join(items[i:i+5])}")
-            
-        except Exception as e:
-            
-            for tag in tags:
-                if tag in meaningless:
-                    self._cache[tag] = None
-                    filtered_log.append(tag)
-                elif tag in synonyms:
-                    canonical = synonyms[tag]
-                    self._cache[tag] = canonical
-                    if canonical not in synonym_groups:
-                        synonym_groups[canonical] = []
-                    synonym_groups[canonical].append(tag)
-                else:
-                    self._cache[tag] = tag
-                    kept_direct.append(tag)
-            
-            # 记录同义词映射频率到数据库，供搜索使用
-            if synonyms:
-                await db.update_tag_mapping_stats(synonyms)
-            
-            # 格式化日志输出
-            logger.info(f"AI处理 {len(tags)} 个Tag:")
-            if filtered_log:
-                # 截断过长列表
-                display = filtered_log[:10]
-                suffix = f"... (+{len(filtered_log)-10})" if len(filtered_log) > 10 else ""
-                logger.info(f"  ❌ 过滤 ({len(filtered_log)}): {', '.join(display)}{suffix}")
-            if synonym_groups:
-                # 格式化为: canonical <- [alias1, alias2]
-                mappings = [f"{c} <- [{', '.join(aliases)}]" for c, aliases in synonym_groups.items()]
-                logger.info(f"  🔗 归类 ({len(synonym_groups)}): {'; '.join(mappings[:5])}")
-            if kept_direct:
-                display = kept_direct[:10]
-                suffix = f"... (+{len(kept_direct)-10})" if len(kept_direct) > 10 else ""
-                logger.info(f"  ✅ 保留 ({len(kept_direct)}): {', '.join(display)}{suffix}")
-            
-        except Exception as e:
-            # 简化报错日志，避免刷屏
-            error_msg = str(e)
-            if "524" in error_msg:
-                logger.warning(f"AI API超时 (524)，跳过本次 Tag 优化")
-            else:
-                logger.error(f"AI处理Tag失败: {e}")
-                
             # 记录错误到数据库 (仅非超时错误)
-            if "524" not in error_msg:
+            if "524" not in str(last_error):
                 try:
-                    err_id = await db.add_ai_error(tags, str(e))
+                    err_id = await db.add_ai_error(tags, str(last_error))
                     self.occurred_errors.append(err_id)
                 except Exception as db_e:
                     logger.error(f"记录错误日志失败: {db_e}")
             
-            # 失败时保留所有tags
+            # 失败时保留所有tags (Fallback)
             for tag in tags:
                 self._cache[tag] = tag
     
@@ -373,13 +347,16 @@ class XPProfiler:
         stop_words: Optional[list[str]] = None,
         discovery_rate: float = 0.1,
         time_decay_days: int = 180,
-        ai_config: Optional[dict] = None
+        ai_config: Optional[dict] = None,
+        saturation_threshold: float = 0.5
     ):
         self.client = client
         self.stop_words = set(stop_words or [])
         self.discovery_rate = discovery_rate
         self.time_decay_days = time_decay_days
         self.ai_processor = AITagProcessor(ai_config or {})
+        self.saturation_threshold = saturation_threshold  # 高频 Tag 饱和度阈值
+        self._blocked_artist_ids: set[int] = set()  # 初始化，由 load_blacklist 填充
         
         # 添加默认停用词（归一化为小写）
         # Pixiv 常见无意义标签
@@ -426,14 +403,25 @@ class XPProfiler:
             self.stop_words.add(word.lower().replace(" ", "_"))
             
     async def load_blacklist(self):
-        """从数据库加载黑名单"""
+        """从数据库加载黑名单 (仅包括用户手动屏蔽的)"""
         try:
-            blacklisted = await db.get_blacklisted_tags()
-            for tag in blacklisted:
+            # 1. 仅加载手动屏蔽的标签
+            # 用户明确要求：没确认就不屏蔽，因此不加载 high-dislike counts
+            blocked_tags = await db.get_blocked_tags()
+            for tag in blocked_tags:
                 self.stop_words.add(self._normalize_tag(tag))
-            logger.info(f"已加载 {len(blacklisted)} 个黑名单Tag")
+            
+            # 2. 加载屏蔽的画师 ID
+            blocked_artists = await db.get_blocked_artists()
+            self._blocked_artist_ids = {artist_id for artist_id, _ in blocked_artists}
+            
+            logger.info(f"已加载黑名单: {len(blocked_tags)} 个手动屏蔽Tag + {len(blocked_artists)} 个屏蔽画师")
         except Exception as e:
             logger.error(f"加载黑名单失败: {e}")
+            self._blocked_artist_ids = set()
+
+            logger.error(f"加载黑名单失败: {e}")
+            self._blocked_artist_ids = set()
     
     async def build_profile(
         self,
@@ -564,12 +552,18 @@ class XPProfiler:
                 except:
                     cdate = datetime.now()
             
+            # 预处理标签：去除 users入り 后缀等
+            raw_tags = json.loads(row['tags'])
+            cleaned_tags = [self._normalize_tag(t) for t in raw_tags]
+            # 过滤空标签并去重（保持顺序）
+            cleaned_tags = list(dict.fromkeys(t for t in cleaned_tags if t))
+            
             analyzed_illusts.append(Illust(
                 id=row['illust_id'],
                 title="Cached",
                 user_id=user_id,
                 user_name="",
-                tags=json.loads(row['tags']),
+                tags=cleaned_tags,
                 bookmark_count=0,
                 view_count=0,
                 page_count=1,
@@ -619,9 +613,30 @@ class XPProfiler:
         # 计算权重
         total_docs = len(bookmarks)
         profile = {}
+        tag_df = {}  # 用于 PMI 计算
+        
+        # 先计算所有 Tag 的 DF 并检测饱和度
+        saturated_tags = []
+        for tag, occurrences in tag_occurrences.items():
+            unique_illusts = set(item[0] for item in occurrences)
+            df = len(unique_illusts)
+            tag_df[tag] = df
+            
+            # 饱和度检测：高频 Tag 自动加入停用词
+            saturation = df / total_docs if total_docs > 0 else 0
+            if saturation > self.saturation_threshold:
+                saturated_tags.append((tag, saturation))
+                self.stop_words.add(tag)
+        
+        if saturated_tags:
+            logger.info(f"🎯 饱和度检测：{len(saturated_tags)} 个高频 Tag 自动加入停用词")
+            for tag, sat in saturated_tags[:5]:  # 只显示前5个
+                logger.info(f"   - {tag}: {sat:.1%}")
         
         for tag, occurrences in tag_occurrences.items():
-            # 正确计算 DF: 包含该 Tag 的不同作品数
+            if tag in self.stop_words:
+                continue  # 跳过饱和 Tag
+                
             unique_illusts = set(item[0] for item in occurrences)
             dates = [item[1] for item in occurrences]
             weights = [item[2] for item in occurrences]  # 权重系数
@@ -655,12 +670,24 @@ class XPProfiler:
                     # 这里简化为：所有组合都统计，但后续根据频率筛选
                     pair_counts[(t1, t2)] += 1
         
-        # 保存热门组合
+        # 保存热门组合 (使用 PMI 优化权重)
         pairs_to_save = []
-        for (t1, t2), count in pair_counts.most_common(50):
-            # 组合权重 = 频率 * (Tag1权重 + Tag2权重)
-            weight = count * (profile.get(t1, 0) + profile.get(t2, 0))
-            pairs_to_save.append((t1, t2, weight))
+        for (t1, t2), count in pair_counts.most_common(100):  # 扩大候选池
+            # 计算 PMI = log(P(t1,t2) / (P(t1) * P(t2)))
+            p_t1 = tag_df.get(t1, 1) / total_docs if total_docs > 0 else 0
+            p_t2 = tag_df.get(t2, 1) / total_docs if total_docs > 0 else 0
+            p_joint = count / total_docs if total_docs > 0 else 0
+            
+            # 防止除零，使用平滑
+            pmi = math.log(p_joint / (p_t1 * p_t2 + 1e-10) + 1e-10)
+            
+            # 结合 PMI 和原权重，PMI 为负表示反相关，过滤掉
+            if pmi > 0:
+                weight = pmi * (profile.get(t1, 0) + profile.get(t2, 0))
+                pairs_to_save.append((t1, t2, weight))
+        
+        # 只保留 Top 50
+        pairs_to_save = sorted(pairs_to_save, key=lambda x: x[2], reverse=True)[:50]
             
         await db.update_xp_tag_pairs(pairs_to_save)
         
@@ -670,14 +697,27 @@ class XPProfiler:
         logger.info(f"构建XP画像完成，共 {len(profile)} 个Tag，{len(pairs_to_save)} 个热门组合")
         return profile
     
+    # 预编译正则：去除 users入り 后缀
+    _pattern_users = re.compile(r"^(.*?)\d+users入り$", re.IGNORECASE)
+    
     def _normalize_tag(self, tag: str) -> str:
         """
         Tag归一化
-        1. 统一转小写
-        2. 去除空格
-        3. 别名映射
+        1. 去除 xxxusers入り 后缀
+        2. 统一转小写
+        3. 去除空格
+        4. 别名映射
         """
-        tag = tag.strip().lower()
+        tag = tag.strip()
+        
+        # 去除 users入り 后缀
+        match = self._pattern_users.match(tag)
+        if match:
+            prefix = match.group(1)
+            if prefix:  # 如果前缀非空，使用前缀
+                tag = prefix
+        
+        tag = tag.lower()
         
         # 检查别名映射
         for alias, canonical in TAG_ALIASES.items():
@@ -706,10 +746,11 @@ class XPProfiler:
         """
         now = datetime.now(occurrence_dates[0].tzinfo if occurrence_dates else None)
         
-        # 如果没有提供权重系数，默认全部为 1.0
-        if weight_multipliers is None:
-            weight_multipliers = [1.0] * len(occurrence_dates)
-        
+        # 0. 高频饱和度过滤 (如果超过阈值如 50%，视为无意义停用词)
+        df_ratio = document_frequency / total_documents if total_documents > 0 else 0
+        if df_ratio > self.saturation_threshold:
+            return 0.0
+
         # 计算带时间衰减的 TF (含权重系数)
         weighted_tf = 0
         for i, date in enumerate(occurrence_dates):
@@ -720,7 +761,15 @@ class XPProfiler:
             # 应用权重系数 (liked items = 0.5x)
             weighted_tf += decay * weight_multipliers[i]
         
-        # 标准 IDF (带平滑防止除零)
+        # 1. 对 TF 应用对数抑制 (防止数量堆积导致的线性无限增长)
+        # log10(1 + 10) = 1.04
+        # log10(1 + 100) = 2.0
+        # log10(1 + 500) = 2.7
+        # 即使有 1000 个收藏，权重也只比 100 个多 35%，而不是 1000%
+        if weighted_tf > 0:
+            weighted_tf = math.log10(1 + weighted_tf)
+        
+        # 2. 标准 IDF (带平滑防止除零)
         idf = math.log(total_documents / (document_frequency + 1)) + 1
         
         return weighted_tf * idf
@@ -744,6 +793,10 @@ class XPProfiler:
         dislike_penalty = config.get("dislike_penalty", 0.3)
         dislike_threshold = config.get("dislike_threshold", 3)
         
+        # 获取当前画像用于分级惩罚
+        profile = await db.get_xp_profile()
+        max_weight = max(profile.values()) if profile else 1
+        
         for tag in illust.tags:
             normalized = self._normalize_tag(tag)
             if not normalized or normalized in self.stop_words:
@@ -754,14 +807,48 @@ class XPProfiler:
                 logger.debug(f"Tag '{normalized}' 权重 +{like_boost}")
             
             elif action == "dislike":
-                await db.adjust_tag_weight(normalized, -dislike_penalty)
+                # 分级惩罚：高权重 Tag 减少惩罚力度（可能是用户核心偏好）
+                current_weight = profile.get(normalized, 0)
+                weight_ratio = current_weight / max_weight if max_weight > 0 else 0
+                # 高权重 Tag 最多减半惩罚
+                adjusted_penalty = dislike_penalty * (1 - weight_ratio * 0.5)
+                
+                await db.adjust_tag_weight(normalized, -adjusted_penalty)
                 count = await db.increment_tag_dislike(normalized)
                 
-                if count >= dislike_threshold:
-                    self.stop_words.add(normalized)
-                    logger.info(f"Tag '{normalized}' 累计否认 {count} 次，加入黑名单")
+                # 用户要求：仅确认一次，没确认就算了
+                if count == dislike_threshold:
+                    # self.stop_words.add(normalized) # <--- 移除自动屏蔽
+                    logger.info(f"Tag '{normalized}' 累计否认 {count} 次，建议加入黑名单")
+                    # 返回建议屏蔽的 Tag (仅返回第一个)
+                    # 3. 画师权重关联 (Artist Weight)
+                    if illust.user_id:
+                        try:
+                            artist_delta = 1.0 if action == "like" else -1.0
+                            await db.update_artist_score(illust.user_id, artist_delta)
+                            logger.debug(f"画师 {illust.user_id} ({illust.user_name}) 权重 {artist_delta:+.1f}")
+                        except Exception as e:
+                            logger.error(f"更新画师权重失败: {e}")
+
+                    # 记录反馈
+                    await db.record_feedback(illust.id, action)
+                    
+                    return normalized
                 else:
-                    logger.debug(f"Tag '{normalized}' 权重 -{dislike_penalty}")
+                    if count > dislike_threshold:
+                         logger.debug(f"Tag '{normalized}' 累计否认 {count} 次 (已提示过)")
+                    else:
+                         logger.debug(f"Tag '{normalized}' 权重 -{adjusted_penalty:.2f} (分级惩罚)")
         
+        # 3. 画师权重关联 (Artist Weight)
+        if illust.user_id:
+            try:
+                artist_delta = 1.0 if action == "like" else -1.0
+                await db.update_artist_score(illust.user_id, artist_delta)
+                logger.debug(f"画师 {illust.user_id} ({illust.user_name}) 权重 {artist_delta:+.1f}")
+            except Exception as e:
+                logger.error(f"更新画师权重失败: {e}")
+
         # 记录反馈
         await db.record_feedback(illust.id, action)
+        return None

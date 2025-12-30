@@ -4,9 +4,11 @@ Pixiv API 异步客户端
 """
 import asyncio
 import logging
-from datetime import datetime
+import random
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 from pixivpy_async import AppPixivAPI
@@ -31,6 +33,7 @@ class Illust:
     is_r18: bool
     ai_type: int  # 0=非AI, 1=辅助AI, 2=纯AI
     create_date: datetime
+    type: str = "illust" # illust, manga, ugoira
 
 
 class PixivClient:
@@ -193,7 +196,7 @@ class PixivClient:
         self,
         tags: list[str],
         bookmark_threshold: int = 0,
-        date_range_days: int = 7,
+        date_range_days: int = 30,  # 默认扩大到 30 天，增加命中率
         limit: int = 50
     ) -> list[Illust]:
         """
@@ -213,32 +216,46 @@ class PixivClient:
         illusts = []
         next_qs = None
         
+        # 计算过滤统计
+        total_fetched = 0
+        filtered_count = 0
+        
         while len(illusts) < limit:
             async with self.rate_limiter:
                 if next_qs:
                     result = await self.api.search_illust(**next_qs)
                 else:
+                    # 动态计算日期范围
+                    if date_range_days > 0:
+                         start_date = (datetime.now() - timedelta(days=date_range_days)).strftime("%Y-%m-%d")
+                    
                     result = await self.api.search_illust(
                         word=query,
                         search_target="partial_match_for_tags",
-                        sort="popular_desc"
+                        sort="popular_desc",
+                        start_date=start_date
                     )
             
             if not result.get("illusts"):
                 break
             
-            for item in result["illusts"]:
+            batch = result["illusts"]
+            total_fetched += len(batch)
+            
+            for item in batch:
                 if len(illusts) >= limit:
                     break
                 illust = self._parse_illust(item)
                 if illust.bookmark_count >= bookmark_threshold:
                     illusts.append(illust)
+                else:
+                    filtered_count += 1
             
             next_qs = self.api.parse_qs(result.get("next_url"))
             if not next_qs:
                 break
         
-        logger.info(f"搜索 '{query}' 得到 {len(illusts)} 个作品")
+        logger.info(f"搜索 '{query}' (近{date_range_days}天): 获取 {total_fetched} -> 过滤 {filtered_count} -> 保留 {len(illusts)}")
         return illusts
     
     @retry_async(max_retries=3)
@@ -282,6 +299,48 @@ class PixivClient:
             if not next_qs:
                 break
         
+        return illusts
+    
+    @retry_async(max_retries=3)
+    async def get_related_illusts(
+        self,
+        illust_id: int,
+        limit: int = 30
+    ) -> list[Illust]:
+        """
+        获取相关作品 (Related Works)
+        
+        Args:
+            illust_id: 种子作品ID
+            limit: 返回数量
+        """
+        illusts = []
+        next_qs = None
+        
+        # 限制只抓取前几页，防止过深
+        max_pages = max(1, limit // 30 + 1)
+        page = 0
+        
+        while len(illusts) < limit and page < max_pages:
+            async with self.rate_limiter:
+                if next_qs:
+                    result = await self.api.illust_related(**next_qs)
+                else:
+                    result = await self.api.illust_related(illust_id=illust_id)
+            
+            if not result.get("illusts"):
+                break
+            
+            for item in result["illusts"]:
+                if len(illusts) >= limit:
+                    break
+                illusts.append(self._parse_illust(item))
+            
+            next_qs = self.api.parse_qs(result.get("next_url"))
+            if not next_qs:
+                break
+            page += 1
+            
         return illusts
     
     @retry_async(max_retries=3)
@@ -479,8 +538,16 @@ class PixivClient:
             image_urls=image_urls,
             is_r18="R-18" in tags,
             ai_type=data.get("illust_ai_type", 0),
-            create_date=create_date
+            create_date=create_date,
+            type=data.get("type", "illust")
         )
+
+    async def get_ugoira_metadata(self, illust_id: int) -> dict:
+        """获取动图元数据"""
+        if not self._logged_in: 
+            return {}
+        async with self.rate_limiter:
+            return await self.api.ugoira_metadata(illust_id)
 
     async def add_bookmark(self, illust_id: int, private: bool = False, tags: Optional[list[str]] = None) -> bool:
         """添加收藏"""
@@ -497,3 +564,16 @@ class PixivClient:
         except Exception as e:
             logger.error(f"添加收藏失败 {illust_id}: {e}")
             return False
+    @retry_async(max_retries=3)
+    async def get_illust_detail(self, illust_id: int) -> Optional[Illust]:
+        """获取作品详情"""
+        if not self._logged_in:
+            logger.warning("获取详情需要登录")
+            return None
+            
+        async with self.rate_limiter:
+            result = await self.api.illust_detail(illust_id)
+            
+        if result and result.get("illust"):
+            return self._parse_illust(result["illust"])
+        return None

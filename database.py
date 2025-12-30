@@ -5,6 +5,7 @@ import json
 import aiosqlite
 from pathlib import Path
 from datetime import datetime, timedelta
+from typing import Optional
 
 DB_PATH = Path(__file__).parent / "data" / "pixiv_xp.db"
 
@@ -14,6 +15,25 @@ async def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     
     async with aiosqlite.connect(DB_PATH) as db:
+        # ============ 简易迁移逻辑 ============
+        # 检查 xp_bookmarks 表是否包含 user_id 列 (旧版没有)
+        try:
+             await db.execute("SELECT user_id FROM xp_bookmarks LIMIT 0")
+        except Exception:
+             await db.execute("DROP TABLE IF EXISTS xp_bookmarks")
+             await db.commit()
+             await db.execute("DROP TABLE IF EXISTS xp_profile")
+             await db.execute("DROP TABLE IF EXISTS xp_tag_pairs")
+             await db.commit()
+        
+        # 检查 illust_cache 表是否包含 user_id 列 (v2 新增)
+        try:
+             await db.execute("SELECT user_id FROM illust_cache LIMIT 0")
+        except Exception:
+             # 旧表只有 tags，删除重建
+             await db.execute("DROP TABLE IF EXISTS illust_cache")
+             await db.commit()
+
         await db.executescript("""
             -- 推送历史
             CREATE TABLE IF NOT EXISTS push_history (
@@ -57,10 +77,12 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             
-            -- 作品缓存(用于反馈处理)
+            -- 作品缓存(用于反馈处理) - v2: 增加画师信息
             CREATE TABLE IF NOT EXISTS illust_cache (
                 illust_id INTEGER PRIMARY KEY,
                 tags TEXT,  -- JSON数组
+                user_id INTEGER,      -- 画师ID
+                user_name TEXT,       -- 画师名
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             
@@ -99,6 +121,34 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS ai_tag_cache (
                 original_tag TEXT PRIMARY KEY,
                 cleaned_tag TEXT,  -- NULL 表示被过滤(meaningless)
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            -- MAB 策略统计表
+            CREATE TABLE IF NOT EXISTS strategy_stats (
+                strategy TEXT PRIMARY KEY,
+                success_count INTEGER DEFAULT 0,
+                total_count INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            -- Bot 快速屏蔽标签 (持久化)
+            CREATE TABLE IF NOT EXISTS blocked_tags (
+                tag TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            -- Bot 快速屏蔽画师 (持久化)
+            CREATE TABLE IF NOT EXISTS blocked_artists (
+                artist_id INTEGER PRIMARY KEY,
+                artist_name TEXT,  -- 可选，用于显示
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- 画师权重档案 (用于 Related Works 策略)
+            CREATE TABLE IF NOT EXISTS artist_profile (
+                artist_id INTEGER PRIMARY KEY,
+                score FLOAT DEFAULT 0,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -177,6 +227,39 @@ async def mark_pushed(illust_id: int, source: str):
             (illust_id, source)
         )
         await db.commit()
+
+async def get_push_source(illust_id: int) -> Optional[str]:
+    """获取推送来源"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT source FROM push_history WHERE illust_id = ?", (illust_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+
+async def get_push_history_paginated(limit: int = 24, offset: int = 0) -> tuple[list[dict], int]:
+    """
+    获取分页的推送历史
+    
+    Returns:
+        (items, total): items 是包含 illust_id 和 pushed_at 的字典列表，total 是总数
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        
+        # 获取总数
+        cursor = await db.execute("SELECT COUNT(*) FROM push_history")
+        total = (await cursor.fetchone())[0]
+        
+        # 获取分页数据
+        cursor = await db.execute(
+            "SELECT illust_id, pushed_at, source FROM push_history ORDER BY pushed_at DESC LIMIT ? OFFSET ?",
+            (limit, offset)
+        )
+        rows = await cursor.fetchall()
+        
+        items = [{"illust_id": row["illust_id"], "pushed_at": row["pushed_at"], "source": row["source"]} for row in rows]
+        
+        return items, total
 
 
 # ============ XP画像 ============
@@ -297,20 +380,19 @@ async def mark_bookmark_scanned(illust_id: int):
 
 
 # ============ 作品缓存 ============
-import json
 
-async def cache_illust(illust_id: int, tags: list[str]):
-    """缓存作品信息"""
+async def cache_illust(illust_id: int, tags: list[str], user_id: int = 0, user_name: str = ""):
+    """缓存作品信息 (v2: 包含画师信息)"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO illust_cache (illust_id, tags, created_at) VALUES (?, ?, ?)",
-            (illust_id, json.dumps(tags), datetime.now())
+            "INSERT OR REPLACE INTO illust_cache (illust_id, tags, user_id, user_name, created_at) VALUES (?, ?, ?, ?, ?)",
+            (illust_id, json.dumps(tags), user_id, user_name, datetime.now())
         )
         await db.commit()
 
 
 async def get_cached_illust_tags(illust_id: int) -> list[str] | None:
-    """获取缓存的作品tags"""
+    """获取缓存的作品tags (兼容旧接口)"""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT tags FROM illust_cache WHERE illust_id = ?", (illust_id,)
@@ -319,6 +401,47 @@ async def get_cached_illust_tags(illust_id: int) -> list[str] | None:
         if row and row[0]:
             return json.loads(row[0])
         return None
+
+
+        return None
+
+
+async def get_cached_illust(illust_id: int) -> dict | None:
+    """获取缓存的完整作品信息 (用于反馈处理)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT illust_id, tags, user_id, user_name FROM illust_cache WHERE illust_id = ?", 
+            (illust_id,)
+        )
+        row = await cursor.fetchone()
+        if row:
+            return {
+                "id": row[0],
+                "tags": json.loads(row[1]) if row[1] else [],
+                "user_id": row[2] or 0,
+                "user_name": row[3] or ""
+            }
+        return None
+
+
+async def delete_cached_illust(illust_id: int):
+    """从缓存中删除作品信息"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM illust_cache WHERE illust_id = ?", (illust_id,)
+        )
+        await db.commit()
+
+
+async def cleanup_old_illust_cache(days: int = 30) -> int:
+    """清理 N 天前的旧缓存记录"""
+    cutoff = datetime.now() - timedelta(days=days)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM illust_cache WHERE created_at < ?", (cutoff,)
+        )
+        await db.commit()
+        return cursor.rowcount
 
 
 # ============ AI 错误处理 ============
@@ -457,15 +580,15 @@ async def get_push_stats(days: int = 7) -> dict:
         
         # Top 画师（从缓存表查）
         cursor = await db.execute("""
-            SELECT ic.artist_id, COUNT(*) as cnt 
+            SELECT ic.user_id, COUNT(*) as cnt 
             FROM push_history ph
             JOIN illust_cache ic ON ph.illust_id = ic.illust_id
             WHERE ph.pushed_at > ?
-            GROUP BY ic.artist_id
+            GROUP BY ic.user_id
             ORDER BY cnt DESC
             LIMIT 5
         """, (since,))
-        top_artists = [(row['artist_id'], row['cnt']) for row in await cursor.fetchall()]
+        top_artists = [(row['user_id'], row['cnt']) for row in await cursor.fetchall()]
         
         # Top 标签（从缓存表查）
         cursor = await db.execute("""
@@ -548,11 +671,257 @@ async def reset_xp_data():
         # 清除 AI 映射统计
         await db.execute("DELETE FROM tag_mapping_stats")
         
-        # 顺便清除 AI 错误日志
+        # 清除 AI 错误日志
         await db.execute("DELETE FROM ai_error_logs")
+        
+        # 清除 MAB 策略统计
+        await db.execute("DELETE FROM strategy_stats")
+        
+        # 清除 AI 处理结果缓存 (让 AI 重新清洗)
+        await db.execute("DELETE FROM ai_tag_cache")
         
         # 注意：不清除 system_state 中的同步进度
         # 这样 Profiler 会跳过 Pixiv API 抓取，直接从 xp_bookmarks 读取缓存进行重分析
         
         await db.commit()
 
+
+# ============ MAB 策略统计 ============
+async def update_strategy_stats(strategy: str, is_success: bool):
+    """
+    更新策略统计
+    success_count += 1 (if success)
+    total_count += 1
+    """
+    success_inc = 1 if is_success else 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO strategy_stats (strategy, success_count, total_count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(strategy) DO UPDATE SET
+                success_count = success_count + excluded.success_count,
+                total_count = total_count + 1,
+                updated_at = CURRENT_TIMESTAMP
+        """, (strategy, success_inc))
+        await db.commit()
+
+async def get_strategy_stats(strategy: str) -> tuple[int, int]:
+    """
+    获取策略统计
+    Returns: (success_count, total_count)
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT success_count, total_count FROM strategy_stats WHERE strategy = ?",
+            (strategy,)
+        )
+        row = await cursor.fetchone()
+        if row:
+            return row[0], row[1]
+        return 0, 0
+
+
+# ============ 快速屏蔽 (Bot /block) ============
+async def block_tag(tag: str):
+    """添加标签到屏蔽列表"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO blocked_tags (tag) VALUES (?)",
+            (tag.lower().strip(),)
+        )
+        await db.commit()
+
+
+async def unblock_tag(tag: str) -> bool:
+    """从屏蔽列表移除标签，并重置其厌恶计数"""
+    tag = tag.lower().strip()
+    async with aiosqlite.connect(DB_PATH) as db:
+        # 1. 移除手动屏蔽
+        cursor = await db.execute(
+            "DELETE FROM blocked_tags WHERE tag = ?",
+            (tag,)
+        )
+        manual_deleted = cursor.rowcount > 0
+        
+        # 2. 重置厌恶计数 (针对自动屏蔽)
+        cursor = await db.execute(
+            "UPDATE tag_feedback_stats SET dislike_count = 0 WHERE tag = ?",
+            (tag,)
+        )
+        stats_updated = cursor.rowcount > 0
+        
+        await db.commit()
+        return manual_deleted or stats_updated
+
+
+async def get_blocked_tags() -> list[str]:
+    """获取所有屏蔽的标签 (手动 + 自动)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # 1. 手动屏蔽
+        cursor = await db.execute("SELECT tag FROM blocked_tags")
+        rows = await cursor.fetchall()
+        manual = {row[0] for row in rows}
+        
+        # 2. 自动屏蔽 (dislike >= 3)
+        # 注意：这里硬编码了 3，最好从 config 传参，但 database 层通常不读 config
+        # 或者我们只利用这个函数返回 manual，profiler 自己处理 auto
+        # 但为了 /unblock 能查到，我们需要在这里聚合
+        # 实际上用户更关心的是"生效的屏蔽"
+        # 让我们把阈值作为参数，默认为 3
+        return list(manual)
+
+async def get_all_blocked_tags(dislike_threshold: int = 3) -> list[str]:
+    """获取所有生效的屏蔽标签 (包括手动和高厌恶)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # 手动
+        cursor = await db.execute("SELECT tag FROM blocked_tags")
+        manual = {row[0] for row in (await cursor.fetchall())}
+        
+        # 自动
+        cursor = await db.execute(
+            "SELECT tag FROM tag_feedback_stats WHERE dislike_count >= ?",
+            (dislike_threshold,)
+        )
+        auto = {row[0] for row in (await cursor.fetchall())}
+        
+        return list(manual | auto)
+
+
+async def is_tag_blocked(tag: str) -> bool:
+    """检查标签是否被屏蔽"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM blocked_tags WHERE tag = ?",
+            (tag.lower().strip(),)
+        )
+        return await cursor.fetchone() is not None
+
+
+# ============ 画师屏蔽 (/block_artist) ============
+async def block_artist(artist_id: int, artist_name: str = None):
+    """添加画师到屏蔽列表"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO blocked_artists (artist_id, artist_name) VALUES (?, ?)",
+            (artist_id, artist_name)
+        )
+        await db.commit()
+
+
+async def unblock_artist(artist_id: int) -> bool:
+    """从屏蔽列表移除画师，返回是否成功移除"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM blocked_artists WHERE artist_id = ?",
+            (artist_id,)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+async def update_artist_score(artist_id: int, delta: float):
+    """更新画师权重分数 (增量)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Upsert logic: insert or update
+        await db.execute("""
+            INSERT INTO artist_profile (artist_id, score, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(artist_id) DO UPDATE SET
+                score = score + ?,
+                updated_at = CURRENT_TIMESTAMP
+        """, (artist_id, delta, delta))
+        await db.commit()
+
+async def get_artist_score(artist_id: int) -> float:
+    """获取画师权重分数"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT score FROM artist_profile WHERE artist_id = ?", (artist_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else 0.0
+
+
+async def get_blocked_artists() -> list[tuple[int, str]]:
+    """获取所有屏蔽的画师，返回 [(artist_id, artist_name), ...]"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT artist_id, artist_name FROM blocked_artists")
+        rows = await cursor.fetchall()
+        return [(row[0], row[1] or str(row[0])) for row in rows]
+
+
+async def is_artist_blocked(artist_id: int) -> bool:
+    """检查画师是否被屏蔽"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM blocked_artists WHERE artist_id = ?",
+            (artist_id,)
+        )
+        return await cursor.fetchone() is not None
+
+
+# ============ XP 画像查询 (/xp) ============
+async def get_top_xp_tags(limit: int = 15) -> list[tuple[str, float]]:
+    """
+    获取权重最高的 Top N 标签
+    Returns: [(tag, weight), ...]
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT tag, weight FROM xp_profile ORDER BY weight DESC LIMIT ?",
+            (limit,)
+        )
+        rows = await cursor.fetchall()
+        return [(row[0], row[1]) for row in rows]
+
+
+# ============ MAB 策略统计汇总 (/stats) ============
+async def get_all_strategy_stats() -> dict[str, dict]:
+    """
+    获取所有策略的统计数据
+    Returns: {strategy: {"success": int, "total": int, "rate": float}, ...}
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT strategy, success_count, total_count FROM strategy_stats"
+        )
+        rows = await cursor.fetchall()
+        result = {}
+        for strategy, success, total in rows:
+            rate = success / total if total > 0 else 0.0
+            result[strategy] = {"success": success, "total": total, "rate": rate}
+        return result
+
+
+# ============ 每日维护辅助函数 ============
+async def sync_blocked_tags_to_xp() -> int:
+    """将屏蔽的标签从 XP 画像中移除，返回移除数量"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            DELETE FROM xp_profile 
+            WHERE tag IN (SELECT tag FROM blocked_tags)
+        """)
+        await db.commit()
+        return cursor.rowcount
+
+
+async def get_uncached_tags(limit: int = 100) -> list[str]:
+    """
+    获取尚未被 AI 处理过的标签 (在 xp_profile 中但不在 ai_tag_cache 中)
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT DISTINCT tag FROM xp_profile 
+            WHERE tag NOT IN (SELECT original_tag FROM ai_tag_cache)
+            LIMIT ?
+        """, (limit,))
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+
+async def cleanup_old_sent_history(days: int = 30) -> int:
+    """清理 N 天前的推送历史记录，返回删除数量"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            DELETE FROM sent_history 
+            WHERE sent_at < datetime('now', ?)
+        """, (f'-{days} days',))
+        await db.commit()
+        return cursor.rowcount

@@ -184,6 +184,35 @@ def login():
     except Exception as e:
         print(f"❌ Error during token request: {e}")
 
+def manual_input():
+    """Allow manual token input for headless servers."""
+    print("\n" + "="*50)
+    print("📝 手动输入模式 (Headless Server)")
+    print("="*50)
+    print("\n如果您在服务器上无法打开浏览器，请：")
+    print("1. 在本地 Windows/Mac 电脑上运行 python get_token.py")
+    print("2. 获取 refresh_token 后复制到此处\n")
+    
+    token = input("请粘贴 refresh_token (留空取消): ").strip()
+    if not token:
+        print("已取消")
+        return
+    
+    user_id = input("请输入 Pixiv User ID (留空自动获取): ").strip()
+    
+    save_to_config(None, token, user_id or None, None)
+    print("✅ Token 已保存!")
+
 if __name__ == "__main__":
-    login()
+    print("\n请选择获取 Token 的方式:")
+    print("  1. 浏览器登录 (需要 GUI 环境)")
+    print("  2. 手动粘贴 Token (服务器环境)")
+    
+    choice = input("\n请选择 (1/2): ").strip()
+    
+    if choice == "2":
+        manual_input()
+    else:
+        login()
+    
     input("\nPress Enter to exit...")

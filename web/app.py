@@ -1,6 +1,6 @@
 """
 Web UI - FastAPI 后端
-素色设计，支持开关
+深色护眼主题，模板化设计
 """
 import hashlib
 import logging
@@ -9,11 +9,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Request, HTTPException, Depends, Form
+from fastapi import FastAPI, Request, HTTPException, Depends, Form, Query, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+import aiohttp
 
 import yaml
 
@@ -31,6 +32,9 @@ TEMPLATES_DIR = Path(__file__).parent / "templates"
 # 确保目录存在
 STATIC_DIR.mkdir(exist_ok=True)
 TEMPLATES_DIR.mkdir(exist_ok=True)
+
+# 初始化模板引擎
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 # 会话存储（简易实现）
 sessions: dict[str, datetime] = {}
@@ -81,17 +85,17 @@ async def index(request: Request):
     if verify_session(request):
         return RedirectResponse("/dashboard")
     
-    return get_login_page()
+    return templates.TemplateResponse("login.html", {"request": request, "active_page": ""})
 
 
 @app.get("/setup", response_class=HTMLResponse)
-async def setup_page():
+async def setup_page(request: Request):
     """首次设置密码页"""
     config = load_config()
     if config.get("web", {}).get("password"):
         return RedirectResponse("/")
     
-    return get_setup_page()
+    return templates.TemplateResponse("setup.html", {"request": request, "active_page": ""})
 
 
 @app.post("/setup")
@@ -143,10 +147,45 @@ async def logout(request: Request):
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, _=Depends(require_auth)):
     """仪表盘"""
+    # 获取 XP 画像
     xp_profile = await db.get_xp_profile()
     top_tags = sorted(xp_profile.items(), key=lambda x: x[1], reverse=True)[:20]
     
-    return get_dashboard_page(top_tags)
+    # 获取推送统计
+    stats = await db.get_push_stats(days=7)
+    
+    # 计算点赞率
+    if stats["total_pushed"] > 0:
+        like_rate = f"{stats['likes'] / stats['total_pushed'] * 100:.1f}%"
+    else:
+        like_rate = "0%"
+    
+    return templates.TemplateResponse("dashboard.html", {
+        "request": request,
+        "active_page": "dashboard",
+        "top_tags": top_tags,
+        "stats": stats,
+        "like_rate": like_rate
+    })
+
+
+@app.get("/gallery", response_class=HTMLResponse)
+async def gallery(request: Request, page: int = Query(1, ge=1), _=Depends(require_auth)):
+    """推送历史画廊"""
+    limit = 24
+    offset = (page - 1) * limit
+    
+    # 获取推送历史
+    items, total = await db.get_push_history_paginated(limit=limit, offset=offset)
+    
+    return templates.TemplateResponse("gallery.html", {
+        "request": request,
+        "active_page": "gallery",
+        "items": items,
+        "total": total,
+        "page": page,
+        "limit": limit
+    })
 
 
 # ============ API 路由 ============
@@ -173,159 +212,77 @@ async def api_xp_profile(request: Request, _=Depends(require_auth)):
     return {"profile": profile}
 
 
-# ============ HTML 模板 ============
-
-def get_base_styles() -> str:
-    """素色UI样式"""
-    return """
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #f5f5f5;
-            color: #333;
-            line-height: 1.6;
-        }
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 2rem;
-        }
-        .card {
-            background: #fff;
-            border-radius: 8px;
-            padding: 2rem;
-            margin-bottom: 1rem;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        h1, h2 { color: #222; margin-bottom: 1rem; }
-        input, button {
-            padding: 0.75rem 1rem;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 1rem;
-            width: 100%;
-            margin-bottom: 1rem;
-        }
-        button {
-            background: #333;
-            color: #fff;
-            cursor: pointer;
-            border: none;
-        }
-        button:hover { background: #555; }
-        .tag-list { display: flex; flex-wrap: wrap; gap: 0.5rem; }
-        .tag {
-            background: #eee;
-            padding: 0.5rem 1rem;
-            border-radius: 20px;
-            font-size: 0.9rem;
-        }
-        .tag-weight {
-            color: #666;
-            font-size: 0.8rem;
-            margin-left: 0.5rem;
-        }
-        nav {
-            background: #333;
-            padding: 1rem 2rem;
-            margin-bottom: 2rem;
-        }
-        nav a {
-            color: #fff;
-            text-decoration: none;
-            margin-right: 1.5rem;
-        }
-        nav a:hover { text-decoration: underline; }
-    </style>
-    """
+@app.get("/health")
+async def health():
+    """健康检查端点 (无需认证)"""
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 
-def get_login_page() -> str:
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>登录 - Pixiv-XP-Pusher</title>
-        {get_base_styles()}
-    </head>
-    <body>
-        <div class="container">
-            <div class="card" style="max-width: 400px; margin: 5rem auto;">
-                <h1>Pixiv-XP-Pusher</h1>
-                <p style="color: #666; margin-bottom: 2rem;">请输入密码登录</p>
-                <form method="post" action="/login">
-                    <input type="password" name="password" placeholder="密码" required>
-                    <button type="submit">登录</button>
-                </form>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-
-
-def get_setup_page() -> str:
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>初始设置 - Pixiv-XP-Pusher</title>
-        {get_base_styles()}
-    </head>
-    <body>
-        <div class="container">
-            <div class="card" style="max-width: 400px; margin: 5rem auto;">
-                <h1>首次设置</h1>
-                <p style="color: #666; margin-bottom: 2rem;">请设置访问密码</p>
-                <form method="post" action="/setup">
-                    <input type="password" name="password" placeholder="设置密码 (至少6位)" required minlength="6">
-                    <input type="password" name="confirm" placeholder="确认密码" required>
-                    <button type="submit">确认</button>
-                </form>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-
-
-def get_dashboard_page(top_tags: list) -> str:
-    tags_html = ""
-    for tag, weight in top_tags:
-        tags_html += f'<span class="tag">{tag}<span class="tag-weight">{weight:.2f}</span></span>'
+@app.get("/api/stats")
+async def api_stats(request: Request, days: int = 7, _=Depends(require_auth)):
+    """获取推送效果统计"""
+    stats = await db.get_push_stats(days)
     
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Dashboard - Pixiv-XP-Pusher</title>
-        {get_base_styles()}
-    </head>
-    <body>
-        <nav>
-            <a href="/dashboard">Dashboard</a>
-            <a href="/logout">登出</a>
-        </nav>
-        <div class="container">
-            <div class="card">
-                <h2>🎯 XP 画像 Top 20</h2>
-                <div class="tag-list">
-                    {tags_html if tags_html else '<p style="color:#666;">暂无数据，请先运行一次推送任务</p>'}
-                </div>
-            </div>
-            
-            <div class="card">
-                <h2>⚡ 快速操作</h2>
-                <p style="color: #666;">使用命令行执行: <code>python main.py --once</code></p>
-            </div>
-        </div>
-    </body>
-    </html>
+    # 计算点赞率
+    if stats["total_pushed"] > 0:
+        like_rate = stats["likes"] / stats["total_pushed"] * 100
+    else:
+        like_rate = 0
+        
+    return {
+        "days": days,
+        "total_pushed": stats["total_pushed"],
+        "likes": stats["likes"],
+        "dislikes": stats["dislikes"],
+        "like_rate": f"{like_rate:.1f}%",
+        "top_artists": stats.get("top_artists", []),
+        "top_tags": stats.get("top_tags", [])
+    }
+
+
+@app.get("/api/gallery")
+async def api_gallery(request: Request, page: int = 1, limit: int = 24, _=Depends(require_auth)):
+    """获取推送历史 (API)"""
+    offset = (page - 1) * limit
+    items, total = await db.get_push_history_paginated(limit=limit, offset=offset)
+    
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "pages": (total // limit) + (1 if total % limit else 0)
+    }
+
+
+@app.get("/api/proxy/image/{illust_id}")
+async def proxy_image(illust_id: int):
     """
+    服务端图片代理
+    解决前端无法直接访问外网图床的问题
+    """
+    config = load_config()
+    # 复用 Telegram 配置的代理
+    proxy = config.get("notifier", {}).get("telegram", {}).get("proxy_url")
+    if proxy and not proxy.startswith("http"):
+        proxy = f"http://{proxy}"
+        
+    urls = [
+        f"https://pixiv.cat/{illust_id}.jpg",
+        f"https://c.pixiv.re/img-master/img/{illust_id}.jpg",
+        f"https://c.pixiv.re/img-master/img/{illust_id}_p0.jpg"
+    ]
+    
+    async with aiohttp.ClientSession() as session:
+        for url in urls:
+            try:
+                async with session.get(url, proxy=proxy, timeout=10, ssl=False) as resp:
+                    if resp.status == 200:
+                        content = await resp.read()
+                        return Response(content, media_type="image/jpeg")
+            except Exception as e:
+                logger.warning(f"代理请求 {url} 失败 (proxy={proxy}): {e}")
+                continue
+                
+    # 失败时返回占位图
+    return RedirectResponse("https://via.placeholder.com/300?text=Load+Failed")

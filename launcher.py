@@ -225,20 +225,15 @@ def main_menu():
             input("\n   按回车键继续...")
             
         elif choice == '4':
-            print("\n   启动定时调度器 (Ctrl+C 停止)")
-            run_command("python main.py")
-            input("\n   按回车键继续...")
-            
-        elif choice == '3':
             print("\n   启动网页管理 (http://localhost:8000)")
             run_command("uvicorn web.app:app --host 0.0.0.0 --port 8000")
             input("\n   按回车键继续...")
             
-        elif choice == '4':
+        elif choice == '5':
             run_command("python get_token.py")
             input("\n   按回车键继续...")
             
-        elif choice == '5':
+        elif choice == '6':
             if os.path.exists(".initialized"):
                 os.remove(".initialized")
             return  # restart wizard

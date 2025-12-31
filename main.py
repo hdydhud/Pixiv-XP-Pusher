@@ -211,10 +211,10 @@ async def setup_notifiers(config: dict, client: PixivClient, profiler: XPProfile
              try:
                  await sync_client.add_bookmark(illust_id)
                  
-                 # 更新 MAB 策略反馈
+                 # 更新 MAB 策略反馈 (排除连锁推荐，连锁只计入 Tag 统计)
                  from database import get_push_source, update_strategy_stats
                  source = await get_push_source(illust_id)
-                 if source:
+                 if source and source != 'related':
                      await update_strategy_stats(source, is_success=True)
                      logger.info(f"MAB策略 '{source}' 获得正反馈")
                 

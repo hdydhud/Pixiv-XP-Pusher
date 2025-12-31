@@ -239,10 +239,17 @@ class TelegramNotifier(BaseNotifier):
         
         from telegram.request import HTTPXRequest
         
-        builder = Application.builder().token(self.bot.token)
+        # 增加超时以减少 "Server disconnected" 错误
+        request_kwargs = {
+            "read_timeout": 30,
+            "write_timeout": 30,
+            "connect_timeout": 30,
+        }
         if self.proxy_url:
-            request = HTTPXRequest(proxy=self.proxy_url)
-            builder = builder.request(request)
+            request_kwargs["proxy"] = self.proxy_url
+        
+        request = HTTPXRequest(**request_kwargs)
+        builder = Application.builder().token(self.bot.token).request(request)
         
         self._app = builder.build()
         

@@ -164,6 +164,50 @@ async def init_db():
         """)
         await db.commit()
 
+
+async def cleanup_old_records(days: int = 180):
+    """
+    清理过期数据，防止数据库无限增长
+    
+    Args:
+        days: 保留最近多少天的记录 (默认 180 天)
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    cutoff_date = datetime.now() - timedelta(days=days)
+    cutoff_str = cutoff_date.strftime("%Y-%m-%d %H:%M:%S")
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        # 清理推送历史
+        cursor = await db.execute(
+            "DELETE FROM push_history WHERE pushed_at < ?", (cutoff_str,)
+        )
+        push_deleted = cursor.rowcount
+        
+        # 清理作品缓存
+        cursor = await db.execute(
+            "DELETE FROM illust_cache WHERE created_at < ?", (cutoff_str,)
+        )
+        cache_deleted = cursor.rowcount
+        
+        # 清理收藏同步记录
+        cursor = await db.execute(
+            "DELETE FROM xp_bookmarks WHERE scanned_at < ?", (cutoff_str,)
+        )
+        bookmarks_deleted = cursor.rowcount
+        
+        await db.commit()
+        
+        # Vacuum 数据库释放空间
+        await db.execute("VACUUM")
+        
+        logger.info(
+            f"🧹 数据库清理完成: 删除 {push_deleted} 条推送历史, "
+            f"{cache_deleted} 条缓存, {bookmarks_deleted} 条收藏记录 "
+            f"(保留最近 {days} 天)"
+        )
+
 async def get_ai_cache_map() -> dict[str, str | None]:
     """获取所有 AI 处理缓存"""
     async with aiosqlite.connect(DB_PATH) as db:
